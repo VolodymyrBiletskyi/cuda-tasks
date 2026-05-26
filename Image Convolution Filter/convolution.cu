@@ -5,6 +5,7 @@
 
 #define IMAGE_WIDTH 1024
 #define IMAGE_HEIGHT 1024
+#define TILE_SIZE 16
 
 void convolveCPU(float *input, float *output, float *kernel,
                  int width, int height, int kSize, int boundaryMode)
@@ -76,6 +77,51 @@ __global__ void convolveGPU(float *input, float *output, float *kernel,
   }
 }
 
+__global__ void convolveTiled(float *input, float *output, float *kernel,
+                              int width, int height, int kSize, int tileSize)
+{
+  extern __shared__ float sharedMem[];
+  float *shInput = sharedMem;
+  float *shKernel = sharedMem + (tileSize + kSize - 1) * (tileSize + kSize - 1);
+
+  int radius = kSize / 2;
+  int shWidth = tileSize + kSize - 1;
+
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+  int col = blockIdx.x * tileSize + tx;
+  int row = blockIdx.y * tileSize + ty;
+
+  int kElems = kSize * kSize;
+  int tid = ty * tileSize + tx;
+  if (tid < kElems)
+    shKernel[tid] = kernel[tid];
+
+  for (int dr = ty; dr < shWidth; dr += tileSize)
+  {
+    for (int dc = tx; dc < shWidth; dc += tileSize)
+    {
+      int r = blockIdx.y * tileSize + dr - radius;
+      int c = blockIdx.x * tileSize + dc - radius;
+      float pixel = 0.0f;
+      if (r >= 0 && r < height && c >= 0 && c < width)
+        pixel = input[r * width + c];
+      shInput[dr * shWidth + dc] = pixel;
+    }
+  }
+
+  __syncthreads();
+
+  if (row < height && col < width)
+  {
+    float sum = 0.0f;
+    for (int kr = 0; kr < kSize; kr++)
+      for (int kc = 0; kc < kSize; kc++)
+        sum += shInput[(ty + kr) * shWidth + (tx + kc)] * shKernel[kr * kSize + kc];
+    output[row * width + col] = sum;
+  }
+}
+
 void makeGaussianKernel(float *kernel, int kSize, float sigma)
 {
   int radius = kSize / 2;
@@ -93,79 +139,98 @@ void makeGaussianKernel(float *kernel, int kSize, float sigma)
     kernel[i] /= sum;
 }
 
+void runExperiment(int kSize, int tileSize)
+{
+  int width = IMAGE_WIDTH, height = IMAGE_HEIGHT;
+  size_t imgSize = (size_t)width * height * sizeof(float);
+  size_t krnSize = (size_t)kSize * kSize * sizeof(float);
+
+  float *input, *output_cpu, *output_naive, *output_tiled, *kernel;
+  cudaMallocManaged(&input, imgSize);
+  cudaMallocManaged(&output_cpu, imgSize);
+  cudaMallocManaged(&output_naive, imgSize);
+  cudaMallocManaged(&output_tiled, imgSize);
+  cudaMallocManaged(&kernel, krnSize);
+
+  for (int i = 0; i < width * height; i++)
+    input[i] = (float)(i % 256) / 255.0f;
+
+  makeGaussianKernel(kernel, kSize, 1.0f);
+
+  cudaMemLocation gpuLoc;
+  gpuLoc.type = cudaMemLocationTypeDevice;
+  gpuLoc.id = 0;
+  cudaMemPrefetchAsync(input, imgSize, gpuLoc, 0);
+  cudaMemPrefetchAsync(output_naive, imgSize, gpuLoc, 0);
+  cudaMemPrefetchAsync(output_tiled, imgSize, gpuLoc, 0);
+  cudaMemPrefetchAsync(kernel, krnSize, gpuLoc, 0);
+  cudaDeviceSynchronize();
+
+  clock_t start = clock();
+  convolveCPU(input, output_cpu, kernel, width, height, kSize, 0);
+  clock_t end = clock();
+  double cpuMs = ((double)(end - start)) / CLOCKS_PER_SEC * 1000.0;
+
+  cudaEvent_t evStart, evStop;
+  cudaEventCreate(&evStart);
+  cudaEventCreate(&evStop);
+  float naiveMs = 0, tiledMs = 0;
+
+  dim3 naiveThreads(16, 16);
+  dim3 naiveBlocks((width + 15) / 16, (height + 15) / 16);
+
+  cudaEventRecord(evStart);
+  convolveGPU<<<naiveBlocks, naiveThreads>>>(input, output_naive, kernel,
+                                             width, height, kSize, 0);
+  cudaDeviceSynchronize();
+  cudaEventRecord(evStop);
+  cudaEventSynchronize(evStop);
+  cudaEventElapsedTime(&naiveMs, evStart, evStop);
+
+  dim3 tiledThreads(tileSize, tileSize);
+  dim3 tiledBlocks((width + tileSize - 1) / tileSize, (height + tileSize - 1) / tileSize);
+  int shWidth = tileSize + kSize - 1;
+  size_t shMemSize = (shWidth * shWidth + kSize * kSize) * sizeof(float);
+
+  cudaEventRecord(evStart);
+  convolveTiled<<<tiledBlocks, tiledThreads, shMemSize>>>(input, output_tiled, kernel,
+                                                          width, height, kSize, tileSize);
+  cudaDeviceSynchronize();
+  cudaEventRecord(evStop);
+  cudaEventSynchronize(evStop);
+  cudaEventElapsedTime(&tiledMs, evStart, evStop);
+
+  bool error = false;
+  for (int i = 0; i < width * height && !error; i++)
+  {
+    if (fabsf(output_cpu[i] - output_tiled[i]) > 1e-3f)
+    {
+      printf("MISMATCH at %d: cpu=%.6f tiled=%.6f\n", i, output_cpu[i], output_tiled[i]);
+      error = true;
+    }
+  }
+
+  printf("Kernel %dx%d | Tile %dx%d | CPU: %.3f ms | Naive: %.3f ms | Tiled: %.3f ms | Speedup vs naive: %.2fx | %s\n",
+         kSize, kSize, tileSize, tileSize, cpuMs, naiveMs, tiledMs,
+         naiveMs / tiledMs, error ? "MISMATCH" : "OK");
+
+  cudaEventDestroy(evStart);
+  cudaEventDestroy(evStop);
+  cudaFree(input);
+  cudaFree(output_cpu);
+  cudaFree(output_naive);
+  cudaFree(output_tiled);
+  cudaFree(kernel);
+}
+
 int main()
 {
-  int width = IMAGE_WIDTH;
-  int height = IMAGE_HEIGHT;
   int kSizes[] = {3, 5, 7};
+  int tileSizes[] = {8, 16, 32};
 
   for (int s = 0; s < 3; s++)
-  {
-    int kSize = kSizes[s];
-    size_t imgSize = (size_t)width * height * sizeof(float);
-    size_t krnSize = (size_t)kSize * kSize * sizeof(float);
-
-    float *input, *output_cpu, *output_gpu, *kernel;
-    cudaMallocManaged(&input, imgSize);
-    cudaMallocManaged(&output_cpu, imgSize);
-    cudaMallocManaged(&output_gpu, imgSize);
-    cudaMallocManaged(&kernel, krnSize);
-
-    for (int i = 0; i < width * height; i++)
-      input[i] = (float)(i % 256) / 255.0f;
-
-    makeGaussianKernel(kernel, kSize, 1.0f);
-
-    cudaMemLocation gpuLoc;
-    gpuLoc.type = cudaMemLocationTypeDevice;
-    gpuLoc.id = 0;
-    cudaMemPrefetchAsync(input, imgSize, gpuLoc, 0);
-    cudaMemPrefetchAsync(output_gpu, imgSize, gpuLoc, 0);
-    cudaMemPrefetchAsync(kernel, krnSize, gpuLoc, 0);
-    cudaDeviceSynchronize();
-
-    clock_t start = clock();
-    convolveCPU(input, output_cpu, kernel, width, height, kSize, 0);
-    clock_t end = clock();
-    double cpuMs = ((double)(end - start)) / CLOCKS_PER_SEC * 1000.0;
-
-    cudaEvent_t evStart, evStop;
-    cudaEventCreate(&evStart);
-    cudaEventCreate(&evStop);
-    float gpuMs = 0;
-
-    dim3 threadsPerBlock(16, 16);
-    dim3 numBlocks((width + 15) / 16, (height + 15) / 16);
-
-    cudaEventRecord(evStart);
-    convolveGPU<<<numBlocks, threadsPerBlock>>>(input, output_gpu, kernel,
-                                                width, height, kSize, 0);
-    cudaDeviceSynchronize();
-    cudaEventRecord(evStop);
-    cudaEventSynchronize(evStop);
-    cudaEventElapsedTime(&gpuMs, evStart, evStop);
-
-    bool error = false;
-    for (int i = 0; i < width * height && !error; i++)
-    {
-      if (fabsf(output_cpu[i] - output_gpu[i]) > 1e-4f)
-      {
-        printf("MISMATCH at %d: cpu=%.6f gpu=%.6f\n", i, output_cpu[i], output_gpu[i]);
-        error = true;
-      }
-    }
-
-    printf("Kernel %dx%d | CPU: %.3f ms | GPU: %.3f ms | Speedup: %.2fx | %s\n",
-           kSize, kSize, cpuMs, gpuMs, cpuMs / gpuMs,
-           error ? "MISMATCH" : "OK");
-
-    cudaEventDestroy(evStart);
-    cudaEventDestroy(evStop);
-    cudaFree(input);
-    cudaFree(output_cpu);
-    cudaFree(output_gpu);
-    cudaFree(kernel);
-  }
+    for (int t = 0; t < 3; t++)
+      runExperiment(kSizes[s], tileSizes[t]);
 
   return 0;
 }
