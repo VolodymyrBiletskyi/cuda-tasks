@@ -7,6 +7,7 @@
 #define IMAGE_HEIGHT 1024
 #define MAX_KERNEL_SIZE 49
 #define MAX_KERNEL_1D 7
+#define PADDING 1
 
 __constant__ float constKernel[MAX_KERNEL_SIZE];
 __constant__ float constKernel1D[MAX_KERNEL_1D];
@@ -84,55 +85,31 @@ __global__ void convolveTiled(float *input, float *output,
   }
 }
 
-__global__ void convolveHorizontal(float *input, float *output,
-                                   int width, int height, int kSize)
+__global__ void convolvePadded(float *input, float *output,
+                               int width, int height, int kSize,
+                               int tileSize, int pitch)
 {
-  extern __shared__ float shRow[];
+  extern __shared__ float shInput[];
 
   int radius = kSize / 2;
+  int shWidth = tileSize + kSize - 1 + PADDING;
+
   int tx = threadIdx.x;
-  int row = blockIdx.y;
-  int col = blockIdx.x * blockDim.x + tx;
-  int shWidth = blockDim.x + kSize - 1;
-
-  for (int dc = tx; dc < shWidth; dc += blockDim.x)
-  {
-    int c = blockIdx.x * blockDim.x + dc - radius;
-    float pixel = 0.0f;
-    if (c >= 0 && c < width && row < height)
-      pixel = input[row * width + c];
-    shRow[dc] = pixel;
-  }
-
-  __syncthreads();
-
-  if (row < height && col < width)
-  {
-    float sum = 0.0f;
-    for (int kc = 0; kc < kSize; kc++)
-      sum += shRow[tx + kc] * constKernel1D[kc];
-    output[row * width + col] = sum;
-  }
-}
-
-__global__ void convolveVertical(float *input, float *output,
-                                 int width, int height, int kSize)
-{
-  extern __shared__ float shCol[];
-
-  int radius = kSize / 2;
   int ty = threadIdx.y;
-  int col = blockIdx.x;
-  int row = blockIdx.y * blockDim.y + ty;
-  int shHeight = blockDim.y + kSize - 1;
+  int col = blockIdx.x * tileSize + tx;
+  int row = blockIdx.y * tileSize + ty;
 
-  for (int dr = ty; dr < shHeight; dr += blockDim.y)
+  for (int dr = ty; dr < shWidth; dr += tileSize)
   {
-    int r = blockIdx.y * blockDim.y + dr - radius;
-    float pixel = 0.0f;
-    if (r >= 0 && r < height && col < width)
-      pixel = input[r * width + col];
-    shCol[dr] = pixel;
+    for (int dc = tx; dc < shWidth - PADDING; dc += tileSize)
+    {
+      int r = blockIdx.y * tileSize + dr - radius;
+      int c = blockIdx.x * tileSize + dc - radius;
+      float pixel = 0.0f;
+      if (r >= 0 && r < height && c >= 0 && c < width)
+        pixel = input[r * pitch + c];
+      shInput[dr * shWidth + dc] = pixel;
+    }
   }
 
   __syncthreads();
@@ -141,8 +118,9 @@ __global__ void convolveVertical(float *input, float *output,
   {
     float sum = 0.0f;
     for (int kr = 0; kr < kSize; kr++)
-      sum += shCol[ty + kr] * constKernel1D[kr];
-    output[row * width + col] = sum;
+      for (int kc = 0; kc < kSize; kc++)
+        sum += shInput[(ty + kr) * shWidth + (tx + kc)] * constKernel[kr * kSize + kc];
+    output[row * pitch + col] = sum;
   }
 }
 
@@ -180,22 +158,30 @@ void makeGaussianKernel1D(float *kernel, int kSize, float sigma)
 void runExperiment(int kSize, int tileSize)
 {
   int width = IMAGE_WIDTH, height = IMAGE_HEIGHT;
+  int pitch = ((width + 31) / 32) * 32;
   size_t imgSize = (size_t)width * height * sizeof(float);
+  size_t imgSizePadded = (size_t)pitch * height * sizeof(float);
   size_t krnSize2D = (size_t)kSize * kSize * sizeof(float);
   size_t krnSize1D = (size_t)kSize * sizeof(float);
 
-  float *input, *output_cpu, *output_tiled, *output_sep, *temp;
+  float *input, *input_padded, *output_cpu;
+  float *output_tiled, *output_padded;
   cudaMallocManaged(&input, imgSize);
+  cudaMallocManaged(&input_padded, imgSizePadded);
   cudaMallocManaged(&output_cpu, imgSize);
   cudaMallocManaged(&output_tiled, imgSize);
-  cudaMallocManaged(&output_sep, imgSize);
-  cudaMallocManaged(&temp, imgSize);
+  cudaMallocManaged(&output_padded, imgSizePadded);
 
   float *kernel2D = (float *)malloc(krnSize2D);
   float *kernel1D = (float *)malloc(krnSize1D);
 
-  for (int i = 0; i < width * height; i++)
-    input[i] = (float)(i % 256) / 255.0f;
+  for (int r = 0; r < height; r++)
+    for (int c = 0; c < width; c++)
+    {
+      float val = (float)((r * width + c) % 256) / 255.0f;
+      input[r * width + c] = val;
+      input_padded[r * pitch + c] = val;
+    }
 
   makeGaussianKernel2D(kernel2D, kSize, 1.0f);
   makeGaussianKernel1D(kernel1D, kSize, 1.0f);
@@ -207,9 +193,9 @@ void runExperiment(int kSize, int tileSize)
   gpuLoc.type = cudaMemLocationTypeDevice;
   gpuLoc.id = 0;
   cudaMemPrefetchAsync(input, imgSize, gpuLoc, 0);
+  cudaMemPrefetchAsync(input_padded, imgSizePadded, gpuLoc, 0);
   cudaMemPrefetchAsync(output_tiled, imgSize, gpuLoc, 0);
-  cudaMemPrefetchAsync(output_sep, imgSize, gpuLoc, 0);
-  cudaMemPrefetchAsync(temp, imgSize, gpuLoc, 0);
+  cudaMemPrefetchAsync(output_padded, imgSizePadded, gpuLoc, 0);
   cudaDeviceSynchronize();
 
   clock_t start = clock();
@@ -220,62 +206,59 @@ void runExperiment(int kSize, int tileSize)
   cudaEvent_t evStart, evStop;
   cudaEventCreate(&evStart);
   cudaEventCreate(&evStop);
-  float tiledMs = 0, sepMs = 0;
+  float tiledMs = 0, paddedMs = 0;
 
-  dim3 tiledThreads(tileSize, tileSize);
-  dim3 tiledBlocks((width + tileSize - 1) / tileSize,
-                   (height + tileSize - 1) / tileSize);
+  dim3 threads(tileSize, tileSize);
+  dim3 blocksUnpadded((width + tileSize - 1) / tileSize,
+                      (height + tileSize - 1) / tileSize);
+  dim3 blocksPadded((pitch + tileSize - 1) / tileSize,
+                    (height + tileSize - 1) / tileSize);
+
   int shWidth = tileSize + kSize - 1;
-  size_t shMemSize = shWidth * shWidth * sizeof(float);
+  int shWidthPadded = shWidth + PADDING;
+  size_t shMemUnpad = shWidth * shWidth * sizeof(float);
+  size_t shMemPadded = shWidthPadded * shWidthPadded * sizeof(float);
 
   cudaEventRecord(evStart);
-  convolveTiled<<<tiledBlocks, tiledThreads, shMemSize>>>(input, output_tiled,
-                                                          width, height, kSize, tileSize);
+  convolveTiled<<<blocksUnpadded, threads, shMemUnpad>>>(input, output_tiled,
+                                                         width, height, kSize, tileSize);
   cudaDeviceSynchronize();
   cudaEventRecord(evStop);
   cudaEventSynchronize(evStop);
   cudaEventElapsedTime(&tiledMs, evStart, evStop);
 
-  dim3 hThreads(128, 1);
-  dim3 hBlocks((width + 127) / 128, height);
-  size_t hShMem = (128 + kSize - 1) * sizeof(float);
-
-  dim3 vThreads(1, 128);
-  dim3 vBlocks(width, (height + 127) / 128);
-  size_t vShMem = (128 + kSize - 1) * sizeof(float);
-
   cudaEventRecord(evStart);
-  convolveHorizontal<<<hBlocks, hThreads, hShMem>>>(input, temp, width, height, kSize);
-  cudaDeviceSynchronize();
-  convolveVertical<<<vBlocks, vThreads, vShMem>>>(temp, output_sep, width, height, kSize);
+  convolvePadded<<<blocksPadded, threads, shMemPadded>>>(input_padded, output_padded,
+                                                         width, height, kSize, tileSize, pitch);
   cudaDeviceSynchronize();
   cudaEventRecord(evStop);
   cudaEventSynchronize(evStop);
-  cudaEventElapsedTime(&sepMs, evStart, evStop);
+  cudaEventElapsedTime(&paddedMs, evStart, evStop);
 
   bool error = false;
-  for (int i = 0; i < width * height && !error; i++)
-  {
-    if (fabsf(output_cpu[i] - output_sep[i]) > 1e-3f)
+  for (int r = 0; r < height && !error; r++)
+    for (int c = 0; c < width && !error; c++)
     {
-      printf("MISMATCH at %d: cpu=%.6f sep=%.6f\n", i, output_cpu[i], output_sep[i]);
-      error = true;
+      if (fabsf(output_cpu[r * width + c] - output_padded[r * pitch + c]) > 1e-3f)
+      {
+        printf("MISMATCH at [%d][%d]\n", r, c);
+        error = true;
+      }
     }
-  }
 
-  printf("Kernel %dx%d | Tile %dx%d | CPU: %.3f ms | Tiled 2D: %.3f ms | Separable: %.3f ms | Speedup sep vs tiled: %.2fx | %s\n",
-         kSize, kSize, tileSize, tileSize, cpuMs, tiledMs, sepMs,
-         tiledMs / sepMs, error ? "MISMATCH" : "OK");
+  printf("Kernel %dx%d | Tile %dx%d | CPU: %.3f ms | Tiled: %.3f ms | Padded: %.3f ms | Speedup padded vs tiled: %.2fx | %s\n",
+         kSize, kSize, tileSize, tileSize, cpuMs, tiledMs, paddedMs,
+         tiledMs / paddedMs, error ? "MISMATCH" : "OK");
 
   cudaEventDestroy(evStart);
   cudaEventDestroy(evStop);
   free(kernel2D);
   free(kernel1D);
   cudaFree(input);
+  cudaFree(input_padded);
   cudaFree(output_cpu);
   cudaFree(output_tiled);
-  cudaFree(output_sep);
-  cudaFree(temp);
+  cudaFree(output_padded);
 }
 
 int main()
