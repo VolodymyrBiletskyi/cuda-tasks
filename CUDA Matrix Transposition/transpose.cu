@@ -2,7 +2,7 @@
 #include <math.h>
 
 #define N 1024
-#define TILE_WIDTH 16
+#define TILE_WIDTH 32
 
 void transposeCPU(float *in, float *out, int n)
 {
